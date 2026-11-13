@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flowza — конструктор автоматизаций</title>
+<link rel="stylesheet" href="/static/vendor/fa/css/all.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- Левая панель: палитра -->
+  <aside id="palette">
+    <div class="panel-title">Палитра нод</div>
+    <div id="palette-search"><input id="palette-input" type="text" placeholder="Поиск…"></div>
+    <div id="palette-cats"></div>
+  </aside>
+
+  <!-- Центр: канвас -->
+  <main id="canvas-wrap">
+    <div id="toolbar">
+      <button class="tb-btn" id="btn-new" title="Новый граф (Ctrl+N)"><i class="fas fa-file"></i></button>
+      <button class="tb-btn" id="btn-open" title="Перечитать файл (Ctrl+O)"><i class="fas fa-folder-open"></i></button>
+      <button class="tb-btn" id="btn-save" title="Сохранить (Ctrl+S)"><i class="fas fa-save"></i></button>
+      <span class="tb-sep"></span>
+      <button class="tb-btn" id="btn-undo" title="Отменить (Ctrl+Z)"><i class="fas fa-undo"></i></button>
+      <button class="tb-btn" id="btn-redo" title="Повторить (Ctrl+Y)"><i class="fas fa-redo"></i></button>
+      <span class="tb-sep"></span>
+      <button class="tb-btn" id="btn-autolayout" title="Автораскладка (Ctrl+L)"><i class="fas fa-sitemap"></i></button>
+      <button class="tb-btn danger" id="btn-delete" title="Удалить выбранное (Del)"><i class="fas fa-trash-alt"></i></button>
+      <span class="tb-sep"></span>
+      <button class="tb-btn run" id="btn-run" title="Запустить (F5)"><i class="fas fa-play"></i> Запустить</button>
+      <span class="tb-spacer"></span>
+      <span id="tb-status">Готово</span>
+    </div>
+    <div id="canvas">
+      <svg id="svg" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+            <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#2a3440" stroke-width="1"/>
+          </pattern>
+        </defs>
+        <g id="bg"><rect id="bg-rect" x="-10000" y="-10000" width="20000" height="20000" fill="url(#grid)"/></g>
+        <g id="edges"></g>
+        <g id="nodes"></g>
+        <g id="draft" style="display:none"><path id="draft-path"/></g>
+      </svg>
+      <div id="hud">
+        <button class="hud-btn" id="hud-out" title="Уменьшить"><i class="fas fa-minus"></i></button>
+        <span id="hud-zoom">100%</span>
+        <button class="hud-btn" id="hud-in" title="Увеличить"><i class="fas fa-plus"></i></button>
+        <button class="hud-btn" id="hud-fit" title="Вписать всё"><i class="fas fa-expand-arrows-alt"></i></button>
+      </div>
+      <div id="edge-menu" class="edge-menu">
+        <button id="edge-menu-delete" title="Удалить связь">
+          <i class="fas fa-trash-alt"></i> Удалить связь
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Правая панель: инспектор -->
+  <aside id="inspector">
+    <div class="panel-title">Свойства</div>
+    <div id="insp-body">
+      <div id="insp-empty" class="muted">Выберите ноду на канвасе,<br>чтобы настроить её параметры.</div>
+      <div id="insp-form" style="display:none">
+        <div id="insp-head">
+          <div id="insp-title">Нода</div>
+          <div id="insp-type" class="muted"></div>
+          <div id="insp-note" class="hint" style="display:none"></div>
+        </div>
+        <div id="insp-fields"></div>
+        <div class="insp-actions">
+          <button id="insp-delete"><i class="fas fa-trash-alt"></i> Удалить ноду</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Панель результата запуска -->
+  <div id="result-panel" style="display:none">
+    <div class="result-head">
+      <span id="result-title">Результат запуска</span>
+      <button id="result-close" title="Закрыть"><i class="fas fa-times"></i></button>
+    </div>
+    <div id="result-body"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

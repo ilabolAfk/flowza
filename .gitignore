@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec.bak
+.venv/
+venv/
+flowza_graph.json
+flowza_runs.log
+exe_log.txt
+exe_err.txt
