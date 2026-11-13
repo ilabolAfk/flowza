@@ -20,6 +20,23 @@ python main.py --port 8800 --no-browser
 pyinstaller Flowza.spec
 ```
 
+## Портативная сборка
+
+`dist\Flowza.exe` — один файл, всё внутри: интерпретатор Python, Flask,
+Werkzeug, Jinja2, `VCRUNTIME140.dll`, статика и шрифт иконок. Python и Flask
+на машине не нужны.
+
+```bash
+pyinstaller Flowza.spec          # dist\Flowza.exe (~18 МБ)
+```
+
+Для переноса на другой ПК: `dist\Flowza-portable.zip` (exe + инструкция).
+Проверено запуском с `PATH=C:\Windows\System32;C:\Windows` — без системного
+Python приложение поднимается и выполняет граф.
+
+Важно: граф сохраняется в `Документы\Flowza`, а не рядом с exe; путь
+переопределяется переменной `FLOWZA_GRAPH`.
+
 ## Где лежит граф
 
 | Запуск | Путь |
