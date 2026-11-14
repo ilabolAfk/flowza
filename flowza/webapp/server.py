@@ -39,7 +39,7 @@ from ..security import (
 
 log = logging.getLogger("flowza")
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 PKG_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = PKG_DIR / "web"
 IS_FROZEN = getattr(sys, "frozen", False)

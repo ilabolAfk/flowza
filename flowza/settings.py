@@ -20,7 +20,11 @@ def data_dir():
     if override:
         return Path(override).expanduser().resolve().parent
     if getattr(sys, "frozen", False):
-        return Path.home() / "Documents" / "Flowza"
+        if sys.platform == "win32":
+            return Path.home() / "Documents" / "Flowza"
+        base = os.environ.get("XDG_DATA_HOME")
+        root = Path(base).expanduser() if base else Path.home() / ".local" / "share"
+        return root / "flowza"
     return PROJECT_DIR
 
 

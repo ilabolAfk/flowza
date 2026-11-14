@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import sys
+
+ICON = 'favicon.ico' if sys.platform == 'win32' else None
+
 
 a = Analysis(
     ['main.py'],

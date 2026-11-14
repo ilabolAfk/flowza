@@ -27,15 +27,46 @@ Werkzeug, Jinja2, `VCRUNTIME140.dll`, статика и шрифт иконок.
 на машине не нужны.
 
 ```bash
-pyinstaller Flowza.spec          # dist\Flowza.exe (~18 МБ)
+pyinstaller Flowza.spec          # dist\Flowza.exe (~16 МБ)
 ```
 
-Для переноса на другой ПК: `dist\Flowza-portable.zip` (exe + инструкция).
+Для переноса на другой ПК: `dist\Flowza-portable-windows.zip` (exe + инструкция).
 Проверено запуском с `PATH=C:\Windows\System32;C:\Windows` — без системного
 Python приложение поднимается и выполняет граф.
 
 Важно: граф сохраняется в `Документы\Flowza`, а не рядом с exe; путь
 переопределяется переменной `FLOWZA_GRAPH`.
+
+## Сборка под Linux
+
+PyInstaller не умеет кросс-компиляцию: ELF-бинарник собирается только на Linux.
+Скрипт делает это в контейнере:
+
+```bash
+./build_linux.sh                 # нужен Docker
+```
+
+Получается `dist/Flowza` (ELF, Debian 12 / glibc 2.36+). Архив для переноса —
+`dist/Flowza-portable-linux.tar.gz`: бинарник, инструкция, `flowza.desktop` и
+`flowza.png` для меню.
+
+```bash
+tar -xzf Flowza-portable-linux.tar.gz
+cd Flowza-linux && chmod +x Flowza && ./Flowza
+```
+
+На Linux данные лежат в `~/.local/share/flowza` (или `$XDG_DATA_HOME/flowza`).
+Иконка в меню ставится файлом `flowza.desktop` — команды есть в инструкции
+внутри архива.
+
+Проверка собранного бинарника:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src/dist python:3.11-slim-bookworm bash -lc \
+  'tar -xzf Flowza-portable-linux.tar.gz -C /tmp && cd /tmp/Flowza-linux && \
+   ./Flowza --no-browser --port 8796 & sleep 12; python3 /src/packaging/verify_linux.py'
+```
+
 
 ## Где лежит граф
 
@@ -43,6 +74,7 @@ Python приложение поднимается и выполняет гра�
 | --- | --- |
 | из исходников | `flowza_graph.json` рядом с проектом |
 | собранный exe | `Документы\Flowza\flowza_graph.json` |
+| собранный бинарник Linux | `~/.local/share/flowza/flowza_graph.json` |
 | переменная окружения | `FLOWZA_GRAPH=/полный/путь/файл.json` |
 
 Сохранение — кнопка «Сохранить» или `Ctrl+S`. Кнопка «Открыть» перечитывает файл с диска.

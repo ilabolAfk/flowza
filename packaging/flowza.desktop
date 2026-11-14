@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Flowza
+Comment=Визуальный конструктор автоматизаций
+Exec=flowza
+Icon=flowza
+Terminal=true
+Categories=Development;Utility;
+Keywords=automation;flow;no-code;
