@@ -6,6 +6,8 @@ dist/
 .venv/
 venv/
 flowza_graph.json
+flowza_graph.json.bak*
+flowza_settings.json
 flowza_runs.log
 exe_log.txt
 exe_err.txt

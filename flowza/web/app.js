@@ -23,6 +23,12 @@ const state = {
   busy: false,
   report: null,
   edgeMenu: null,   // {id, x, y} — выбранная связь и её точка в мировых координатах
+  settings: null,
+  settingsTab: "run",
+  runId: null,
+  runTimer: null,
+  progress: {},
+  autosaveTimer: null,
 };
 
 const $ = (s) => document.querySelector(s);
@@ -53,6 +59,16 @@ const FA = {
   send: ["fa-paper-plane", "\uf1d8"],
   note: ["fa-sticky-note", "\uf249"],
   eye: ["fa-eye", "\uf06e"],
+  globe: ["fa-globe", "\uf0ac"],
+  loop: ["fa-sync-alt", "\uf2f1"],
+  sigma: ["fa-layer-group", "\uf5fd"],
+  code: ["fa-code", "\uf121"],
+  calendar: ["fa-calendar-alt", "\uf073"],
+  "file-in": ["fa-file-import", "\uf56f"],
+  "file-out": ["fa-file-export", "\uf56e"],
+  database: ["fa-database", "\uf1c0"],
+  cog: ["fa-cog", "\uf013"],
+  history: ["fa-history", "\uf1da"],
   dot: ["fa-circle", "\uf111"],
 };
 
@@ -923,47 +939,153 @@ function setBusy(busy) {
   button.innerHTML = busy
     ? '<i class="fas fa-circle-notch fa-spin"></i> Выполняется'
     : '<i class="fas fa-play"></i> Запустить';
+  const cancel = $("#btn-cancel");
+  cancel.style.display = busy ? "" : "none";
+  cancel.disabled = !busy;
+}
+
+function graphPayload() {
+  return JSON.stringify({
+    nodes: state.graph.nodes.map((n) => ({
+      id: n.id, type: n.type, x: n.x, y: n.y, params: n.params,
+    })),
+    edges: state.graph.edges,
+    seed: {},
+  });
 }
 
 async function runGraph() {
   if (state.busy) return;
   if (!state.graph.nodes.length) { setStatus("Граф пуст: добавьте ноды", true); return; }
+  if (state.settings && state.settings.run && state.settings.run.autosave_before_run) {
+    await saveGraph(true);
+  }
   setBusy(true);
+  state.progress = {};
   setStatus("Запуск…");
   try {
     const res = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        nodes: state.graph.nodes.map((n) => ({
-          id: n.id, type: n.type, x: n.x, y: n.y, params: n.params,
-        })),
-        edges: state.graph.edges,
-        seed: {},
-      }),
+      body: graphPayload(),
     });
     const data = await res.json().catch(() => null);
-    if (!res.ok || !data) {
-      setStatus("Ошибка сервера: " + (data && data.error ? data.error : res.status), true);
+    if (!res.ok || !data || data.ok === false) {
+      setBusy(false);
+      setStatus("Не удалось запустить: " +
+        ((data && data.error) || res.status), true);
       return;
     }
-    if (data.error) { setStatus("Ошибка: " + data.error, true); return; }
-    state.report = data.report || {};
-    applyStatuses();
-    showResult(data);
-    const s = data.summary || {};
-    setStatus(`Готово: ${s.done || 0} выполнено, ${s.skipped || 0} пропущено, ` +
-      `${s.error || 0} ошибок`, (s.error || 0) > 0);
+    state.runId = data.run_id;
+    startProgressPolling();
+  } catch (err) {
+    setBusy(false);
+    setStatus("Ошибка сети: " + err.message, true);
+  }
+}
+
+function startProgressPolling() {
+  stopProgressPolling();
+  state.runTimer = setInterval(pollRun, 350);
+  pollRun();
+}
+
+function stopProgressPolling() {
+  if (state.runTimer) clearInterval(state.runTimer);
+  state.runTimer = null;
+}
+
+function progressCounts(progress) {
+  const counts = { done: 0, skipped: 0, error: 0, cycle: 0,
+    total: 0, finished: 0 };
+  Object.values(progress || {}).forEach((entry) => {
+    counts.total += 1;
+    if (entry.status && entry.status !== "running") counts.finished += 1;
+    if (counts[entry.status] !== undefined) counts[entry.status] += 1;
+  });
+  return counts;
+}
+
+function renderProgress(progress) {
+  const counts = progressCounts(progress);
+  state.report = progress || {};
+  applyStatuses();
+  const percent = counts.total
+    ? Math.round((counts.finished / counts.total) * 100) : 0;
+  $("#progress-bar").style.display = "";
+  $("#progress-fill").style.width = percent + "%";
+  setStatus(`Выполняется: ${counts.finished}/${counts.total} · ` +
+    `${counts.done} готово, ${counts.error} ошибок`);
+  return percent;
+}
+
+async function pollRun() {
+  const id = state.runId;
+  if (!id) return;
+  let data = null;
+  try {
+    const res = await fetch("/api/run/" + encodeURIComponent(id));
+    data = await res.json().catch(() => null);
+    if (!res.ok || !data) {
+      throw new Error((data && data.error) || res.status);
+    }
+  } catch (err) {
+    stopProgressPolling();
+    state.runId = null;
+    setBusy(false);
+    setStatus("Проверка прогона не удалась: " + err.message, true);
+    return;
+  }
+  renderProgress(data.progress);
+  if (data.status === "running") return;
+
+  stopProgressPolling();
+  state.runId = null;
+  setBusy(false);
+  const result = data.result || {};
+  state.report = result.report || {};
+  applyStatuses();
+  showResult({
+    report: result.report || {},
+    result: result.result || {},
+    order: result.order || [],
+    summary: data.summary || result.summary || {},
+  });
+  const labels = {
+    done: "Готово", error: "Завершено с ошибками",
+    cancelled: "Остановлено", timeout: "Превышен таймаут",
+  };
+  const s = data.summary || {};
+  setStatus(`${labels[data.status] || data.status}: ${s.done || 0} выполнено, ` +
+    `${s.skipped || 0} пропущено, ${s.error || 0} ошибок`,
+    data.status === "error" || data.status === "timeout");
+  $("#progress-fill").style.width = "100%";
+  setTimeout(() => {
+    $("#progress-bar").style.display = "none";
+    $("#progress-fill").style.width = "0";
+  }, 1500);
+}
+
+async function cancelRun() {
+  if (!state.runId) { setStatus("Нет активного прогона", true); return; }
+  try {
+    const res = await fetch("/api/cancel", { method: "POST" });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.ok) {
+      setStatus("Не удалось остановить: " +
+        ((data && data.error) || res.status), true);
+      return;
+    }
+    setStatus("Останавливаю прогон…");
   } catch (err) {
     setStatus("Ошибка сети: " + err.message, true);
-  } finally {
-    setBusy(false);
   }
 }
 
 function applyStatuses() {
   document.querySelectorAll(".node-group").forEach((group) => {
-    group.classList.remove("status-done", "status-error", "status-skipped", "status-cycle");
+    group.classList.remove("status-done", "status-error", "status-skipped",
+      "status-cycle", "status-running");
     const info = state.report && state.report[group.dataset.id];
     if (info && info.status) group.classList.add("status-" + info.status);
   });
@@ -972,7 +1094,8 @@ function applyStatuses() {
 function clearStatuses() {
   state.report = null;
   document.querySelectorAll(".node-group").forEach((group) => {
-    group.classList.remove("status-done", "status-error", "status-skipped", "status-cycle");
+    group.classList.remove("status-done", "status-error", "status-skipped",
+      "status-cycle", "status-running");
   });
 }
 
@@ -1041,6 +1164,380 @@ function showResult(data) {
 $("#result-close").onclick = () => { $("#result-panel").style.display = "none"; };
 
 // ==========================================================================
+// Настройки, тема и автосохранение
+// ==========================================================================
+const SETTINGS_SECTIONS = [
+  {
+    key: "run", title: "Прогон",
+    fields: [
+      { key: "pause_ms", label: "Пауза между нодами, мс", type: "number", min: 0, max: 5000 },
+      { key: "timeout_s", label: "Таймаут прогона, с", type: "number", min: 5, max: 3600 },
+      { key: "on_error", label: "При ошибке", type: "select",
+        options: [["continue", "продолжать"], ["stop", "остановить прогон"]] },
+      { key: "retries", label: "Повторов при ошибке", type: "number", min: 0, max: 3 },
+      { key: "autosave_before_run", label: "Сохранять граф перед запуском",
+        type: "checkbox", full: true },
+    ],
+  },
+  {
+    key: "files", title: "Файлы",
+    fields: [
+      { key: "autosave_sec", label: "Автосохранение, с (0 — выключено)",
+        type: "number", min: 0, max: 600 },
+      { key: "backups", label: "Резервных копий графа", type: "number", min: 0, max: 50 },
+      { key: "workspace", label: "Рабочая папка для файлов", type: "text", full: true,
+        hint: "Абсолютный путь. Пусто — папка по умолчанию рядом с графом." },
+    ],
+  },
+  {
+    key: "mail", title: "Почта",
+    fields: [
+      { key: "smtp_host", label: "SMTP-сервер", type: "text" },
+      { key: "smtp_port", label: "Порт", type: "number", min: 1, max: 65535 },
+      { key: "smtp_user", label: "Пользователь", type: "text" },
+      { key: "from_addr", label: "Отправитель по умолчанию", type: "text" },
+      { key: "password_env", label: "Переменная с паролем", type: "text" },
+      { key: "tls", label: "STARTTLS", type: "checkbox" },
+    ],
+  },
+  {
+    key: "ui", title: "Интерфейс",
+    fields: [
+      { key: "theme", label: "Тема", type: "select",
+        options: [["dark", "тёмная"], ["light", "светлая"]] },
+      { key: "grid", label: "Шаг сетки, px", type: "number", min: 8, max: 64 },
+    ],
+  },
+  {
+    key: "webhook", title: "Вебхук",
+    fields: [
+      { key: "enabled", label: "Принимать входящие вебхуки", type: "checkbox" },
+      { key: "token_env", label: "Переменная с токеном", type: "text" },
+    ],
+  },
+  {
+    key: "security", title: "Безопасность",
+    fields: [
+      { key: "allow_private_urls", label: "Разрешить запросы во внутреннюю сеть",
+        type: "checkbox", full: true,
+        hint: "По умолчанию запрещено: защита от SSRF на localhost и в локальной сети." },
+    ],
+  },
+];
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme === "light" ? "light" : "dark";
+}
+
+function applyUiSettings() {
+  const ui = (state.settings && state.settings.ui) || {};
+  applyTheme(ui.theme);
+  const grid = Number(ui.grid) || 24;
+  const pattern = $("#grid");
+  if (pattern) {
+    pattern.setAttribute("width", grid);
+    pattern.setAttribute("height", grid);
+    const line = pattern.querySelector("path");
+    if (line) line.setAttribute("d", `M ${grid} 0 L 0 0 0 ${grid}`);
+  }
+}
+
+function settingsValue(section, key) {
+  const part = state.settings && state.settings[section];
+  return part ? part[key] : undefined;
+}
+
+function fieldValue(section, key) {
+  const value = settingsValue(section, key);
+  return value === undefined || value === null ? "" : value;
+}
+
+async function loadSettings() {
+  try {
+    const res = await fetch("/api/settings");
+    const data = await res.json();
+    if (data && data.settings) {
+      state.settings = data.settings;
+      applyUiSettings();
+      setupAutosave();
+    }
+  } catch (err) {
+    console.warn("Настройки недоступны:", err.message);
+  }
+}
+
+function renderSettingsTabs() {
+  const box = $("#settings-tabs");
+  box.innerHTML = "";
+  SETTINGS_SECTIONS.forEach((section) => {
+    const tab = document.createElement("button");
+    tab.className = "tab" + (state.settingsTab === section.key ? " active" : "");
+    tab.textContent = section.title;
+    tab.onclick = () => {
+      state.settingsTab = section.key;
+      renderSettingsTabs();
+      renderSettingsForm();
+    };
+    box.appendChild(tab);
+  });
+}
+
+function renderSettingsForm() {
+  const section = SETTINGS_SECTIONS.find((item) => item.key === state.settingsTab)
+    || SETTINGS_SECTIONS[0];
+  const box = $("#settings-form");
+  box.innerHTML = "";
+  const grid = document.createElement("div");
+  grid.className = "settings-grid";
+
+  section.fields.forEach((field) => {
+    const wrap = document.createElement("div");
+    wrap.className = "field" + (field.full ? " full" : "");
+    const label = document.createElement("label");
+    label.textContent = field.label;
+    wrap.appendChild(label);
+
+    let input;
+    if (field.type === "select") {
+      input = document.createElement("select");
+      field.options.forEach(([value, text]) => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        input.appendChild(option);
+      });
+      input.value = String(fieldValue(section.key, field.key));
+      if (!input.value && field.options.length) input.value = field.options[0][0];
+    } else if (field.type === "checkbox") {
+      input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = !!settingsValue(section.key, field.key);
+    } else {
+      input = document.createElement("input");
+      input.type = field.type === "number" ? "number" : "text";
+      if (field.min !== undefined) input.min = field.min;
+      if (field.max !== undefined) input.max = field.max;
+      input.value = fieldValue(section.key, field.key);
+    }
+    input.dataset.section = section.key;
+    input.dataset.key = field.key;
+    input.dataset.kind = field.type;
+    wrap.appendChild(input);
+
+    if (field.hint) {
+      const hint = document.createElement("div");
+      hint.className = "hint";
+      hint.textContent = field.hint;
+      wrap.appendChild(hint);
+    }
+    grid.appendChild(wrap);
+  });
+
+  box.appendChild(grid);
+  renderSettingsEnv(section.key);
+}
+
+function renderSettingsEnv(sectionKey) {
+  const box = $("#settings-env");
+  const env = (state.settings && state.settings.env) || {};
+  const lines = [];
+  if (sectionKey === "mail") {
+    lines.push(`Пароль SMTP: ${env.smtp_password_set ? "задан" : "не задан"} ` +
+      `(${env.smtp_password_env || "FLOWZA_SMTP_PASSWORD"})`);
+  } else if (sectionKey === "webhook") {
+    lines.push(`Токен: ${env.webhook_token_set ? "задан" : "не задан"} ` +
+      `(${env.webhook_token_env || "FLOWZA_WEBHOOK_TOKEN"})`);
+    lines.push("Приём: POST /hook/<суффикс>. Без токена принимаются только локальные запросы.");
+  } else if (sectionKey === "files") {
+    lines.push("Рабочая папка: " +
+      ((state.settings && state.settings.files
+        && state.settings.files.workspace_resolved) || "—"));
+  } else if (sectionKey === "security") {
+    lines.push("Внутренние адреса запрещены по умолчанию — это защита от SSRF.");
+  }
+  box.textContent = lines.join(" · ");
+  box.style.display = lines.length ? "" : "none";
+}
+
+function isModalOpen() {
+  return ["#settings-modal", "#history-modal"].some((selector) => {
+    const el = $(selector);
+    return el && el.style.display !== "none";
+  });
+}
+
+function closeModals() {
+  ["#settings-modal", "#history-modal", "#modal-backdrop"].forEach((selector) => {
+    const el = $(selector);
+    if (el) el.style.display = "none";
+  });
+}
+
+async function openSettings() {
+  $("#modal-backdrop").style.display = "";
+  $("#settings-modal").style.display = "flex";
+  try {
+    const res = await fetch("/api/settings");
+    const data = await res.json();
+    if (data && data.settings) state.settings = data.settings;
+  } catch (err) {
+    console.warn("Настройки недоступны:", err.message);
+  }
+  $("#settings-paths").textContent =
+    "Граф: " + ((state.settings && state.settings.graph_file) || "—");
+  $("#settings-warnings").textContent = "";
+  renderSettingsTabs();
+  renderSettingsForm();
+}
+
+function settingInputs() {
+  return [...document.querySelectorAll("#settings-form [data-section]")];
+}
+
+async function saveSettings() {
+  const patch = {};
+  settingInputs().forEach((input) => {
+    const section = input.dataset.section;
+    const key = input.dataset.key;
+    const kind = input.dataset.kind;
+    let value;
+    if (kind === "checkbox") value = input.checked;
+    else if (kind === "number") value = input.value === "" ? 0 : Number(input.value);
+    else value = input.value;
+    (patch[section] ||= {})[key] = value;
+  });
+  try {
+    const res = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.ok) {
+      setStatus("Настройки не сохранены: " +
+        ((data && data.error) || res.status), true);
+      return;
+    }
+    state.settings = data.settings;
+    applyUiSettings();
+    setupAutosave();
+    const warnings = data.warnings || [];
+    $("#settings-warnings").textContent = warnings.join("; ");
+    setStatus("Настройки сохранены");
+    if (!warnings.length) closeModals();
+  } catch (err) {
+    setStatus("Ошибка сети: " + err.message, true);
+  }
+}
+
+function setupAutosave() {
+  if (state.autosaveTimer) clearInterval(state.autosaveTimer);
+  state.autosaveTimer = null;
+  const seconds = Number((state.settings && state.settings.files
+    && state.settings.files.autosave_sec) || 0);
+  if (seconds > 0) {
+    state.autosaveTimer = setInterval(() => {
+      if (state.dirty && !state.busy) saveGraph(true);
+    }, seconds * 1000);
+  }
+}
+
+// ==========================================================================
+// История прогонов
+// ==========================================================================
+function runStatusLabel(status) {
+  return {
+    done: "готово", error: "ошибка", cancelled: "отменено",
+    timeout: "таймаут", running: "идёт",
+  }[status] || status;
+}
+
+async function openHistory() {
+  $("#modal-backdrop").style.display = "";
+  $("#history-modal").style.display = "flex";
+  await refreshHistory();
+}
+
+async function refreshHistory() {
+  const box = $("#history-body");
+  box.innerHTML = '<div class="history-empty">Загрузка…</div>';
+  let runs = [];
+  try {
+    const res = await fetch("/api/runs");
+    const data = await res.json().catch(() => null);
+    runs = (data && data.runs) || [];
+  } catch (err) {
+    box.innerHTML = '<div class="history-empty">Не удалось загрузить историю</div>';
+    return;
+  }
+  box.innerHTML = "";
+  if (!runs.length) {
+    box.innerHTML = '<div class="history-empty">Пока нет ни одного прогона</div>';
+    return;
+  }
+  runs.forEach((run) => {
+    const row = document.createElement("div");
+    row.className = "history-row";
+
+    const when = document.createElement("span");
+    when.className = "history-when";
+    when.textContent = run.started_wall
+      ? new Date(run.started_wall * 1000).toLocaleString("ru-RU",
+        { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
+      : "—";
+    row.appendChild(when);
+
+    const source = document.createElement("span");
+    source.className = "history-source";
+    source.textContent = { manual: "вручную", schedule: "расписание",
+      webhook: "вебхук" }[run.source] || run.source;
+    row.appendChild(source);
+
+    const summary = document.createElement("span");
+    summary.className = "history-summary";
+    const s = run.summary || {};
+    summary.textContent = `${s.done || 0} / ${s.skipped || 0} / ${s.error || 0}`;
+    row.appendChild(summary);
+
+    const badge = document.createElement("span");
+    badge.className = "run-badge " + (run.status || "done");
+    badge.textContent = runStatusLabel(run.status);
+    row.appendChild(badge);
+
+    const open = document.createElement("button");
+    open.className = "history-open";
+    open.textContent = "Открыть";
+    open.onclick = () => openRun(run.run_id);
+    row.appendChild(open);
+
+    box.appendChild(row);
+  });
+}
+
+async function openRun(runId) {
+  try {
+    const res = await fetch("/api/run/" + encodeURIComponent(runId));
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.result) {
+      setStatus("Результат этого прогона недоступен", true);
+      return;
+    }
+    closeModals();
+    const result = data.result;
+    state.report = result.report || {};
+    applyStatuses();
+    showResult({
+      report: result.report || {},
+      result: result.result || {},
+      order: result.order || [],
+      summary: data.summary || result.summary || {},
+    });
+  } catch (err) {
+    setStatus("Ошибка сети: " + err.message, true);
+  }
+}
+
+// ==========================================================================
 // Сохранение / загрузка
 // ==========================================================================
 function payloadOfGraph() {
@@ -1052,7 +1549,7 @@ function payloadOfGraph() {
   });
 }
 
-async function saveGraph() {
+async function saveGraph(silent = false) {
   try {
     const res = await fetch("/api/save", {
       method: "POST",
@@ -1066,7 +1563,7 @@ async function saveGraph() {
     }
     state.dirty = false;
     document.title = "Flowza — конструктор автоматизаций";
-    setStatus("Сохранено → " + data.file);
+    if (!silent) setStatus("Сохранено → " + data.file);
   } catch (err) {
     setStatus("Ошибка сети: " + err.message, true);
   }
@@ -1187,12 +1684,21 @@ function zoomDelta(factor) {
 function bindToolbar() {
   $("#btn-new").onclick = newGraph;
   $("#btn-open").onclick = () => loadGraph(true);
-  $("#btn-save").onclick = saveGraph;
+  $("#btn-save").onclick = () => saveGraph();
   $("#btn-run").onclick = runGraph;
+  $("#btn-cancel").onclick = cancelRun;
   $("#btn-autolayout").onclick = autoLayout;
   $("#btn-delete").onclick = deleteSelected;
   $("#btn-undo").onclick = undo;
   $("#btn-redo").onclick = redo;
+  $("#btn-settings").onclick = openSettings;
+  $("#btn-history").onclick = openHistory;
+  $("#settings-save").onclick = saveSettings;
+  $("#history-refresh").onclick = refreshHistory;
+  $("#modal-backdrop").onclick = closeModals;
+  document.querySelectorAll("[data-close]").forEach((button) => {
+    button.onclick = closeModals;
+  });
   $("#hud-in").onclick = () => zoomDelta(1.12);
   $("#hud-out").onclick = () => zoomDelta(1 / 1.12);
   $("#hud-fit").onclick = fitView;
@@ -1223,7 +1729,12 @@ document.addEventListener("keydown", (e) => {
     deleteSelected();
     return;
   }
-  if (e.key === "Escape") { closeEdgeMenu(); clearSelection(); return; }
+  if (e.key === "Escape") {
+    if (isModalOpen()) { closeModals(); return; }
+    closeEdgeMenu();
+    clearSelection();
+    return;
+  }
 
   if (e.ctrlKey || e.metaKey) {
     const key = e.key.toLowerCase();
@@ -1248,6 +1759,7 @@ async function init() {
     setStatus("Не удалось загрузить каталог нод: " + err.message, true);
     return;
   }
+  await loadSettings();
   wirePortEvents();
   setupCanvasEvents();
   setupNodeDrag();

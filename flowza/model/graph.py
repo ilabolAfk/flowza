@@ -4,9 +4,47 @@
 """
 
 import json
+import math
+import re
 import uuid
 
+from ..security import MAX_GRAPH_EDGES, MAX_GRAPH_NODES, MAX_PARAM_CHARS
 from .registry import node_spec
+
+_ID_CLEAN = re.compile(r"[^A-Za-z0-9_-]")
+MAX_PARAM_KEY = 64
+MAX_PARAMS = 50
+COORD_LIMIT = 100_000
+
+
+def _coord(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number):
+        return 0
+    return int(max(-COORD_LIMIT, min(COORD_LIMIT, number)))
+
+
+def _clean_params(raw, warnings, node_id):
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        warnings.append(f"нода {node_id}: параметры должны быть объектом")
+        return {}
+    clean = {}
+    for key, value in list(raw.items())[:MAX_PARAMS * 2]:
+        name = str(key)[:MAX_PARAM_KEY]
+        if isinstance(value, (bool, int, float)) or value is None:
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+            clean[name] = value
+        elif isinstance(value, str):
+            clean[name] = value[:MAX_PARAM_CHARS]
+        else:
+            warnings.append(f"нода {node_id}: параметр {name} пропущен (сложный тип)")
+    return clean
 
 
 class Port:
@@ -33,7 +71,7 @@ class Node:
         self.node_id = node_id or uuid.uuid4().hex[:8]
         self.node_type = node_type
         self.title = spec["title"]
-        self.pos = pos if pos else (0, 0)
+        self.pos = (_coord(pos[0]), _coord(pos[1])) if pos else (0, 0)
         # Параметры формы со значениями по умолчанию из реестра
         self.params = {}
         for p in spec.get("params", []):
@@ -134,24 +172,58 @@ class Graph:
     @classmethod
     def from_dict(cls, data):
         g = cls()
-        for payload in data.get("nodes", []):
+        if not isinstance(data, dict):
+            g.load_warnings.append("граф должен быть объектом")
+            return g
+        nodes = data.get("nodes", [])
+        edges = data.get("edges", [])
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            g.load_warnings.append("nodes и edges должны быть массивами")
+            return g
+        if len(nodes) > MAX_GRAPH_NODES:
+            g.load_warnings.append(
+                f"слишком много нод: загружены первые {MAX_GRAPH_NODES}")
+        if len(edges) > MAX_GRAPH_EDGES:
+            g.load_warnings.append(
+                f"слишком много связей: загружены первые {MAX_GRAPH_EDGES}")
+
+        for payload in nodes[:MAX_GRAPH_NODES]:
+            if not isinstance(payload, dict):
+                g.load_warnings.append("нода пропущена: ожидался объект")
+                continue
             node_type = payload.get("type")
+            if not isinstance(node_type, str) or len(node_type) > 64:
+                g.load_warnings.append("нода пропущена: некорректный тип")
+                continue
+            raw_id = payload.get("id")
+            node_id = None
+            if raw_id is not None:
+                node_id = _ID_CLEAN.sub("", str(raw_id))[:40] or None
             try:
-                node = g.add_node(node_type,
-                                  (payload.get("x", 0), payload.get("y", 0)),
-                                  payload.get("id"))
-            except (ValueError, KeyError) as exc:
+                node = g.add_node(node_type, (payload.get("x", 0), payload.get("y", 0)),
+                                  node_id)
+            except (ValueError, KeyError, TypeError) as exc:
                 g.load_warnings.append(f"нода пропущена: {exc}")
                 continue
-            node.params.update(payload.get("params") or {})
-        for payload in data.get("edges", []):
+            node.params.update(_clean_params(payload.get("params"), g.load_warnings,
+                                             node.node_id))
+
+        for payload in edges[:MAX_GRAPH_EDGES]:
+            if not isinstance(payload, dict):
+                g.load_warnings.append("связь пропущена: ожидался объект")
+                continue
             try:
-                g.add_edge(payload["source"], payload["source_port"],
-                           payload["target"], payload["target_port"])
-                if payload.get("id"):
-                    g.edges[-1].edge_id = payload["id"]
-            except (KeyError, ValueError) as exc:
+                source = str(payload["source"])
+                target = str(payload["target"])
+                source_port = str(payload["source_port"])
+                target_port = str(payload["target_port"])
+                g.add_edge(source, source_port, target, target_port)
+            except (KeyError, ValueError, TypeError) as exc:
                 g.load_warnings.append(f"связь пропущена: {exc}")
+                continue
+            edge_id = payload.get("id")
+            if edge_id:
+                g.edges[-1].edge_id = _ID_CLEAN.sub("", str(edge_id))[:40]
         return g
 
     def source_nodes(self):

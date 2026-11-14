@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Flowza — конструктор автоматизаций</title>
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
 <link rel="stylesheet" href="/static/vendor/fa/css/all.min.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -30,9 +31,14 @@
       <button class="tb-btn danger" id="btn-delete" title="Удалить выбранное (Del)"><i class="fas fa-trash-alt"></i></button>
       <span class="tb-sep"></span>
       <button class="tb-btn run" id="btn-run" title="Запустить (F5)"><i class="fas fa-play"></i> Запустить</button>
+      <button class="tb-btn danger" id="btn-cancel" title="Остановить прогон" style="display:none"><i class="fas fa-stop"></i> Отменить</button>
       <span class="tb-spacer"></span>
       <span id="tb-status">Готово</span>
+      <span class="tb-sep"></span>
+      <button class="tb-btn" id="btn-history" title="История прогонов"><i class="fas fa-history"></i></button>
+      <button class="tb-btn" id="btn-settings" title="Настройки"><i class="fas fa-cog"></i></button>
     </div>
+    <div id="progress-bar" style="display:none"><div id="progress-fill"></div></div>
     <div id="canvas">
       <svg id="svg" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -88,6 +94,43 @@
   </div>
 </div>
 
-<script src="/static/app.js"></script>
+  <!-- Модальные окна -->
+  <div id="modal-backdrop" class="modal-backdrop" style="display:none"></div>
+
+  <div id="settings-modal" class="modal" role="dialog" aria-modal="true"
+       aria-labelledby="settings-title" style="display:none">
+    <div class="modal-head">
+      <span id="settings-title"><i class="fas fa-cog"></i> Настройки</span>
+      <button class="modal-close" data-close title="Закрыть"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body">
+      <div id="settings-tabs" class="tabs"></div>
+      <div id="settings-form"></div>
+      <div id="settings-env" class="settings-env"></div>
+      <div id="settings-warnings" class="settings-warnings"></div>
+    </div>
+    <div class="modal-foot">
+      <span id="settings-paths" class="muted"></span>
+      <span class="tb-spacer"></span>
+      <button class="btn secondary" data-close>Отмена</button>
+      <button class="btn primary" id="settings-save">Сохранить</button>
+    </div>
+  </div>
+
+  <div id="history-modal" class="modal" role="dialog" aria-modal="true"
+       aria-labelledby="history-title" style="display:none">
+    <div class="modal-head">
+      <span id="history-title"><i class="fas fa-history"></i> История прогонов</span>
+      <button class="modal-close" data-close title="Закрыть"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body" id="history-body"></div>
+    <div class="modal-foot">
+      <button class="btn secondary" id="history-refresh">Обновить</button>
+      <span class="tb-spacer"></span>
+      <button class="btn secondary" data-close>Закрыть</button>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
 </body>
 </html>
