@@ -15,6 +15,7 @@
 
 import ast
 import csv
+import http.client
 import io
 import json
 import logging
@@ -25,7 +26,6 @@ import smtplib
 import sqlite3
 import ssl
 import time
-import urllib.error
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
@@ -50,6 +50,9 @@ from ..security import (
     header_text,
     http_request,
     parse_emails,
+    regex_search,
+    regex_split,
+    regex_sub,
     safe_log_text,
     safe_path,
     safe_text,
@@ -758,25 +761,23 @@ def _headers(raw):
     return prepared
 
 
-def _safe_http(url, *, method, timeout, headers=None, body=None, allow_private=False):
+def _safe_http(url, *, method, timeout, headers=None, body=None,
+               allow_private=False, context=None):
     try:
         return http_request(url, method=method, body=body, timeout=timeout,
-                            headers=headers, allow_private=allow_private)
-    except urllib.error.HTTPError as exc:
-        raise NodeError(f"HTTP {exc.code} {exc.reason} от {url}")
-    except urllib.error.URLError as exc:
-        raise NodeError(f"сеть недоступна: {exc.reason}")
-    except OSError as exc:
+                            headers=headers, allow_private=allow_private,
+                            context=context)
+    except (OSError, http.client.HTTPException) as exc:
         raise NodeError(f"ошибка запроса: {exc}")
 
 
-def _http_get(params):
+def _http_get(params, context=None):
     url = str(params.get("url") or "").strip()
     timeout = _int_param(params, "timeout", 10, 1, HTTP_TIMEOUT_LIMIT)
     headers = _headers(params.get("headers"))
     status, response_headers, text = _safe_http(
         url, method="GET", timeout=timeout, headers=headers,
-        allow_private=_allow_private_urls())
+        allow_private=_allow_private_urls(), context=context)
     path = str(params.get("path") or "").strip()
     content_type = str(response_headers.get("Content-Type") or "").lower()
     value = text
@@ -900,13 +901,11 @@ def _regex(params, payload):
         flags |= re.IGNORECASE
     elif mode_flags == "многострочный":
         flags |= re.MULTILINE
-    pattern = compile_regex(str(params.get("pattern") or ""))
-    if flags:
-        pattern = re.compile(pattern.pattern, pattern.flags | flags)
+    pattern = compile_regex(str(params.get("pattern") or ""), flags)
 
     mode = str(params.get("mode") or "извлечь")
     if mode == "извлечь":
-        match = pattern.search(text)
+        match = regex_search(pattern, text)
         if match is None:
             value = None
         else:
@@ -917,11 +916,11 @@ def _regex(params, payload):
                 raise NodeError(f"в шаблоне нет группы {group}")
     elif mode == "заменить":
         replacement = str(params.get("replacement") or "")
-        value = pattern.sub(replacement, text)
+        value = regex_sub(pattern, replacement, text)
         if len(value) > MAX_REGEX_SUBJECT:
             value = value[:MAX_REGEX_SUBJECT]
     elif mode == "разделить":
-        parts = pattern.split(text)
+        parts = regex_split(pattern, text)
         if len(parts) > MAX_ARRAY_ITEMS:
             raise NodeError("слишком много частей после разделения")
         value = parts
@@ -1080,7 +1079,9 @@ def _sqlite(params):
 
 
 # ------------------------------------------------------------------ почта
-def _send_mail(params, payload):
+def _send_mail(params, payload, context=None):
+    if context is not None:
+        context.check()
     cfg = _settings().get("mail", {})
     host = str(params.get("smtp_host") or os.environ.get("FLOWZA_SMTP_HOST")
                or cfg.get("smtp_host") or "").strip()
@@ -1153,7 +1154,7 @@ def _send_mail(params, payload):
                    "server": f"{host}:{port}"}}
 
 
-def _post_webhook(params, payload):
+def _post_webhook(params, payload, context=None):
     url = str(params.get("url") or "").strip()
     method = str(params.get("method") or "POST").upper()
     if method not in ("POST", "PUT", "GET"):
@@ -1169,8 +1170,8 @@ def _post_webhook(params, payload):
     status, _headers_out, text = _safe_http(
         url, method=method, timeout=timeout, body=body,
         headers={"Content-Type": "application/json; charset=utf-8",
-                 "User-Agent": "Flowza/1.0"},
-        allow_private=_allow_private_urls())
+                 "User-Agent": "Flowza/1.1"},
+        allow_private=_allow_private_urls(), context=context)
     return {"ok": {"status": status, "url": url, "response": text[:2000]}}
 
 
@@ -1316,13 +1317,13 @@ def _run_node(node, inputs, context):
         return _sqlite(params)
 
     if ty == "http.get":
-        return _http_get(params)
+        return _http_get(params, context)
 
     if ty == "action.mail":
-        return _send_mail(params, payload)
+        return _send_mail(params, payload, context)
 
     if ty == "action.webhook":
-        return _post_webhook(params, payload)
+        return _post_webhook(params, payload, context)
 
     if ty == "action.ai":
         prompt = _fill_template(params.get("prompt", ""), payload)

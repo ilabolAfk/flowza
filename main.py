@@ -6,6 +6,7 @@
 """
 
 import argparse
+import os
 import socket
 import sys
 
@@ -41,6 +42,16 @@ def port_is_free(host, port):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    from flowza.security import is_loopback_host
+
+    if not is_loopback_host(args.host) and not os.environ.get("FLOWZA_API_TOKEN"):
+        print(f"[Flowza] Адрес {args.host} открывает API всей сети.", file=sys.stderr)
+        print("[Flowza] Задайте токен и передавайте его в заголовке "
+              "X-Flowza-Token:", file=sys.stderr)
+        print("[Flowza]   set FLOWZA_API_TOKEN=длинная-строка   "
+              "(Linux: export FLOWZA_API_TOKEN=...)", file=sys.stderr)
+        return 2
 
     try:
         from flowza.webapp.server import launch

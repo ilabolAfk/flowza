@@ -1448,7 +1448,7 @@ function setupAutosave() {
 function runStatusLabel(status) {
   return {
     done: "готово", error: "ошибка", cancelled: "отменено",
-    timeout: "таймаут", running: "идёт",
+    timeout: "таймаут", running: "идёт", queued: "в очереди",
   }[status] || status;
 }
 

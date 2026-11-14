@@ -5,6 +5,7 @@
 """
 
 import hmac
+import http.client
 import ipaddress
 import math
 import re
@@ -12,9 +13,13 @@ import socket
 import ssl
 import threading
 import time
-import urllib.request
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
+
+try:
+    import regex as _regex
+except ImportError:
+    _regex = None
 
 MAX_GRAPH_NODES = 300
 MAX_GRAPH_EDGES = 1000
@@ -48,6 +53,9 @@ _EMAIL = re.compile(
     r"@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251})[A-Za-z0-9]$"
 )
 _CSV_RISKY = ("=", "+", "-", "@", "\t", "\r")
+_CSV_NUMBER = re.compile(r"^[+-]?\d{1,18}(?:[.,]\d{1,10})?$")
+_REGEX_TIMEOUT = 2.0
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
 
 class SecurityError(ValueError):
@@ -175,8 +183,34 @@ def _ip_blocked(ip):
     return False
 
 
-def safe_url(raw, *, allow_private=False):
-    """Проверить URL: схема, отсутствие учётных данных, публичный адрес."""
+def _resolve_address(host, port, blocker):
+    """Один раз разрешить хост в IP; при blocker — запретить внутренние адреса."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise SecurityError(f"не удалось разрешить адрес «{host}»: {exc}")
+    if not infos:
+        raise SecurityError(f"не удалось разрешить адрес «{host}»")
+    chosen = None
+    for info in infos:
+        raw_ip = str(info[4][0]).split("%")[0]
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            raise SecurityError("некорректный адрес хоста")
+        if blocker is not None and blocker(ip):
+            raise SecurityError("адрес ведёт во внутреннюю сеть: запрос запрещён")
+        if chosen is None:
+            chosen = str(ip)
+    return chosen
+
+
+def resolve_target(raw, *, allow_private=False):
+    """Разобрать URL и вернуть (scheme, host, port, ip, target).
+
+    Хост резолвится здесь один раз; соединение потом идёт на проверенный IP,
+    поэтому DNS-rebinding между проверкой и запросом не срабатывает.
+    """
     text = str(raw or "").strip()
     if not text:
         raise SecurityError("пустой URL")
@@ -198,52 +232,108 @@ def safe_url(raw, *, allow_private=False):
         raise SecurityError("некорректный порт в URL")
     if port is not None and not 1 <= port <= 65535:
         raise SecurityError("некорректный порт в URL")
+    port = port or (443 if parts.scheme == "https" else 80)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+
     if allow_private:
-        return text
+        return parts.scheme, host, port, _resolve_address(host, port, None), target
 
     if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
         raise SecurityError("запросы к localhost запрещены настройками")
     if host.endswith((".local", ".internal", ".home.arpa")):
         raise SecurityError("запросы во внутреннюю сеть запрещены настройками")
-    try:
-        infos = socket.getaddrinfo(
-            host, port or (443 if parts.scheme == "https" else 80),
-            type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise SecurityError(f"не удалось разрешить адрес «{host}»: {exc}")
-    if not infos:
-        raise SecurityError(f"не удалось разрешить адрес «{host}»")
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            raise SecurityError("некорректный адрес хоста")
-        if _ip_blocked(ip):
-            raise SecurityError("адрес ведёт во внутреннюю сеть: запрос запрещён")
-    return text
+    address = _resolve_address(host, port, _ip_blocked)
+    return parts.scheme, host, port, address, target
 
 
-class _SafeRedirect(urllib.request.HTTPRedirectHandler):
-    """Редирект проверяется тем же правилом, что и исходный адрес."""
-
-    max_redirections = 3
-    max_repeats = 2
-
-    def __init__(self, allow_private):
-        self.allow_private = allow_private
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        safe_url(newurl, allow_private=self.allow_private)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+def safe_url(raw, *, allow_private=False):
+    """Проверить URL: схема, отсутствие учётных данных, публичный адрес."""
+    resolve_target(raw, allow_private=allow_private)
+    return str(raw or "").strip()
 
 
 SSL_CONTEXT = ssl.create_default_context()
 
 
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Соединение строго с проверенным IP; имя хоста нужно для Host."""
+
+    def __init__(self, host, port, address, timeout):
+        super().__init__(host, port, timeout=timeout)
+        self._address = address
+
+    def connect(self):
+        self.sock = socket.create_connection((self._address, self.port), self.timeout)
+        self.sock.settimeout(self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS с проверенным IP: SNI и сертификат проверяются по имени хоста."""
+
+    def __init__(self, host, port, address, timeout):
+        super().__init__(host, port, timeout=timeout, context=SSL_CONTEXT)
+        self._address = address
+
+    def connect(self):
+        sock = socket.create_connection((self._address, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        self.sock.settimeout(self.timeout)
+
+
+def _read_limited(response, connection, deadline, max_bytes, context):
+    """Читать тело кусками, проверяя отмену и общий дедлайн."""
+    chunks = []
+    total = 0
+    while True:
+        if context is not None:
+            context.check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SecurityError("истёк таймаут запроса")
+        if connection.sock is not None:
+            try:
+                connection.sock.settimeout(min(remaining, 5.0))
+            except OSError:
+                pass
+        try:
+            chunk = response.read(65536)
+        except (TimeoutError, socket.timeout):
+            continue
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise SecurityError("ответ сервера слишком большой")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _pinned_request(scheme, host, port, address, target, *, method, payload,
+                    headers, deadline, max_bytes, context):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SecurityError("истёк таймаут запроса")
+    connection_class = (_PinnedHTTPSConnection if scheme == "https"
+                        else _PinnedHTTPConnection)
+    connection = connection_class(host, port, address, min(5.0, remaining))
+    try:
+        connection.request(method, target, body=payload, headers=headers)
+        response = connection.getresponse()
+        status = response.status
+        out_headers = {name: value for name, value in response.getheaders()}
+        if status in _REDIRECT_CODES:
+            return status, out_headers, out_headers.get("Location"), b""
+        raw = _read_limited(response, connection, deadline, max_bytes, context)
+        return status, out_headers, None, raw
+    finally:
+        connection.close()
+
+
 def http_request(url, *, method="GET", body=None, timeout=10, headers=None,
-                 allow_private=False, max_bytes=MAX_HTTP_RESPONSE):
-    """HTTP-запрос без прокси, с проверкой адреса и ограничением ответа."""
-    safe_url(url, allow_private=allow_private)
+                 allow_private=False, max_bytes=MAX_HTTP_RESPONSE, context=None):
+    """HTTP-запрос без прокси: адрес проверяется один раз, соединение идёт на IP."""
     payload = None
     if body is not None:
         if not isinstance(body, (bytes, bytearray)):
@@ -255,24 +345,37 @@ def http_request(url, *, method="GET", body=None, timeout=10, headers=None,
     for name, value in (headers or {}).items():
         prepared[header_text(name, limit=64)] = header_text(value, limit=2048)
 
-    request = urllib.request.Request(url, data=payload,
-                                     method=str(method or "GET").upper(),
-                                     headers=prepared)
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        _SafeRedirect(allow_private),
-        urllib.request.HTTPSHandler(context=SSL_CONTEXT),
-    )
-    with opener.open(request, timeout=max(1.0, float(timeout))) as response:
-        raw = response.read(max_bytes + 1)
-        if len(raw) > max_bytes:
-            raise SecurityError("ответ сервера слишком большой")
-        charset = response.headers.get_content_charset() or "utf-8"
+    method = str(method or "GET").upper()
+    if method not in ("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"):
+        raise SecurityError(f"неподдерживаемый метод: {method}")
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    current = str(url or "").strip()
+
+    for _ in range(4):
+        if context is not None:
+            context.check()
+        scheme, host, port, address, target = resolve_target(
+            current, allow_private=allow_private)
+        status, out_headers, location, raw = _pinned_request(
+            scheme, host, port, address, target, method=method, payload=payload,
+            headers=prepared, deadline=deadline, max_bytes=max_bytes,
+            context=context)
+        if location and status in _REDIRECT_CODES:
+            current = urljoin(current, location)
+            if status == 303 or (status in (301, 302) and method not in ("GET", "HEAD")):
+                method, payload = "GET", None
+            continue
+        charset = ""
+        for name, value in out_headers.items():
+            if name.lower() == "content-type" and "charset=" in value.lower():
+                charset = value.lower().split("charset=", 1)[1].split(";")[0].strip()
         try:
-            text = raw.decode(charset, "replace")
+            text = raw.decode(charset or "utf-8", "replace")
         except LookupError:
             text = raw.decode("utf-8", "replace")
-        return response.status, dict(response.headers), text
+        return status, out_headers, text
+
+    raise SecurityError("слишком много перенаправлений")
 
 
 def check_json(value, *, max_depth=MAX_JSON_DEPTH, max_nodes=MAX_JSON_NODES):
@@ -300,8 +403,8 @@ def check_json(value, *, max_depth=MAX_JSON_DEPTH, max_nodes=MAX_JSON_NODES):
     return value
 
 
-def compile_regex(pattern):
-    """Скомпилировать регулярное выражение с защитой от катастрофического бэктрекинга."""
+def compile_regex(pattern, flags=0):
+    """Скомпилировать выражение: эвристика + движок regex с таймаутом."""
     text = str(pattern or "")
     if not text:
         raise SecurityError("пустое регулярное выражение")
@@ -310,15 +413,47 @@ def compile_regex(pattern):
     if _NESTED_QUANTIFIER.search(text):
         raise SecurityError("вложенные квантификаторы запрещены: шаблон может "
                             "подвесить прогон")
+    module = _regex if _regex is not None else re
     try:
-        return re.compile(text)
-    except re.error as exc:
+        return module.compile(text, flags)
+    except Exception as exc:
         raise SecurityError(f"некорректное регулярное выражение: {exc}")
 
 
+def _timed(pattern, operation, timeout=_REGEX_TIMEOUT):
+    """Выполнить операцию regex; движок regex прерывает по таймауту."""
+    if _regex is not None and isinstance(pattern, _regex.Pattern):
+        try:
+            return operation(pattern, timeout)
+        except TimeoutError:
+            raise SecurityError(
+                f"регулярное выражение не уложилось в {timeout:g} с")
+    return operation(pattern, None)
+
+
+def regex_search(pattern, subject, timeout=_REGEX_TIMEOUT):
+    return _timed(pattern, lambda rx, limit: (
+        rx.search(subject, timeout=limit) if limit is not None else rx.search(subject)),
+        timeout)
+
+
+def regex_sub(pattern, replacement, subject, timeout=_REGEX_TIMEOUT):
+    return _timed(pattern, lambda rx, limit: (
+        rx.sub(replacement, subject, timeout=limit) if limit is not None
+        else rx.sub(replacement, subject)), timeout)
+
+
+def regex_split(pattern, subject, timeout=_REGEX_TIMEOUT):
+    return _timed(pattern, lambda rx, limit: (
+        rx.split(subject, timeout=limit) if limit is not None
+        else rx.split(subject)), timeout)
+
+
 def csv_cell(value):
-    """Защита от CSV-инъекций при выгрузке."""
+    """Защита от CSV-инъекций: числа-строки не портим, формулы экранируем."""
     if isinstance(value, str) and value.startswith(_CSV_RISKY):
+        if _CSV_NUMBER.match(value):
+            return value
         return "'" + value
     return value
 
@@ -360,6 +495,17 @@ class RateLimiter:
                 self._hits = {name: stamps for name, stamps in self._hits.items()
                               if stamps and now - stamps[-1] < self.window}
             return True
+
+
+def is_loopback_host(host):
+    """Адрес слушает только этот компьютер?"""
+    text = str(host or "").strip().lower()
+    if text == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
 
 
 def origin_host(origin):

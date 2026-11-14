@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -33,13 +33,14 @@ from ..security import (
     RateLimiter,
     SecurityError,
     check_json,
+    is_loopback_host,
     origin_host,
     token_ok,
 )
 
 log = logging.getLogger("flowza")
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 PKG_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = PKG_DIR / "web"
 IS_FROZEN = getattr(sys, "frozen", False)
@@ -71,6 +72,12 @@ HOOK_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 RUNS = OrderedDict()
 RUN_LOCK = threading.RLock()
 ACTIVE = {"id": None}
+RUN_QUEUE = deque()
+QUEUE_COND = threading.Condition(RUN_LOCK)
+QUEUE_LIMIT = 20
+WAIT_TIMEOUT = 600
+WORKER = {"thread": None}
+PENDING_STATUSES = ("queued", "running")
 HOOK_LIMIT = RateLimiter(30, 60.0)
 RUN_LIMIT = RateLimiter(30, 60.0)
 SCHEDULER = None
@@ -152,6 +159,9 @@ class RunState:
     result: dict = field(default_factory=dict)
     error: str = ""
     cancel: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    graph: object = None
+    seed: dict = field(default_factory=dict)
 
     def snapshot(self, with_result=False):
         elapsed = (self.finished_at or time.monotonic()) - self.started_at
@@ -193,13 +203,14 @@ def _finish_run(state, result):
     log.info("Прогон %s (%s): %s", state.run_id, state.source,
              json.dumps(result.summary, ensure_ascii=False))
     _keep_results()
+    state.done.set()
 
 
 def _keep_results():
     with RUN_LOCK:
         states = list(RUNS.values())
     for state in states[:-KEEP_RESULTS] if len(states) > KEEP_RESULTS else []:
-        if state.status != "running":
+        if state.status not in PENDING_STATUSES:
             state.result = {}
 
 
@@ -213,48 +224,97 @@ def _progress_callback(state):
     return update
 
 
-def start_run(graph, seed, source="manual", wait=False):
-    state = RunState(run_id=uuid.uuid4().hex[:12], source=source,
-                     started_at=time.monotonic())
+def _ensure_worker():
     with RUN_LOCK:
-        if ACTIVE["id"]:
-            return None, "уже выполняется другой прогон"
+        thread = WORKER["thread"]
+        if thread is not None and thread.is_alive():
+            return
+        worker = threading.Thread(target=_worker_loop, name="flowza-runs",
+                                  daemon=True)
+        WORKER["thread"] = worker
+    worker.start()
+
+
+def _worker_loop():
+    while True:
+        with QUEUE_COND:
+            while not RUN_QUEUE:
+                QUEUE_COND.wait()
+            state = RUN_QUEUE.popleft()
+        try:
+            _execute(state)
+        except Exception:
+            log.exception("Очередь прогонов: сбой воркера")
+
+
+def _execute(state):
+    with RUN_LOCK:
+        if state.status == "cancelled":
+            state.done.set()
+            return
+        state.status = "running"
         ACTIVE["id"] = state.run_id
+    options = RunOptions.from_settings(SETTINGS.get())
+    try:
+        result = Engine().run(state.graph, state.seed, options=options,
+                              progress=_progress_callback(state),
+                              cancel=state.cancel)
+    except Exception as exc:
+        log.exception("Прогон %s упал", state.run_id)
+        failed = RunResult(started_at=state.started_at,
+                           finished_at=time.monotonic(),
+                           error=f"{type(exc).__name__}: {exc}")
+        _finish_run(state, failed)
+        return
+    _finish_run(state, result)
+
+
+def start_run(graph, seed, source="manual", wait=False):
+    """Поставить прогон в очередь; wait=True ждёт завершения (тесты и API)."""
+    state = RunState(run_id=uuid.uuid4().hex[:12], source=source,
+                     started_at=time.monotonic(),
+                     started_wall=time.time())
+    state.graph = graph
+    state.seed = dict(seed or {})
+    with QUEUE_COND:
+        if len(RUN_QUEUE) >= QUEUE_LIMIT:
+            return None, "очередь прогонов заполнена: подождите"
+        state.status = "queued"
         RUNS[state.run_id] = state
         while len(RUNS) > HISTORY_LIMIT:
             RUNS.popitem(last=False)
-    options = RunOptions.from_settings(SETTINGS.get())
-
-    def work():
-        try:
-            result = Engine().run(graph, seed, options=options,
-                                  progress=_progress_callback(state),
-                                  cancel=state.cancel)
-        except Exception as exc:
-            log.exception("Прогон %s упал", state.run_id)
-            failed = RunResult(started_at=state.started_at,
-                               finished_at=time.monotonic(),
-                               error=f"{type(exc).__name__}: {exc}")
-            _finish_run(state, failed)
-            return
-        _finish_run(state, result)
-
+        RUN_QUEUE.append(state)
+        QUEUE_COND.notify()
+    _ensure_worker()
     if wait:
-        work()
-        return state, None
-    threading.Thread(target=work, name=f"flowza-run-{state.run_id}",
-                     daemon=True).start()
+        state.done.wait(WAIT_TIMEOUT)
     return state, None
 
 
-def cancel_active():
-    with RUN_LOCK:
-        run_id = ACTIVE["id"]
-        state = RUNS.get(run_id) if run_id else None
-    if state is None:
-        return None
-    state.cancel.set()
+def cancel_run(run_id=None):
+    """Отменить прогон: из очереди убрать, выполняющийся — попросить остановиться."""
+    with QUEUE_COND:
+        target = run_id or ACTIVE["id"]
+        if target is None and RUN_QUEUE:
+            target = RUN_QUEUE[-1].run_id
+        state = RUNS.get(target) if target else None
+        if state is None or state.status not in PENDING_STATUSES:
+            return None
+        if state.status == "queued":
+            for index, queued in enumerate(RUN_QUEUE):
+                if queued.run_id == state.run_id:
+                    del RUN_QUEUE[index]
+                    break
+            state.status = "cancelled"
+            state.error = "прогон отменён до запуска"
+        else:
+            state.cancel.set()
+    state.done.set()
     return state.run_id
+
+
+def cancel_active():
+    return cancel_run(None)
 
 
 def _find_run(run_id):
@@ -275,8 +335,22 @@ def _unexpected_error(exc):
 
 
 # ---------------------------------------------------------------- защита
+def _api_token():
+    return os.environ.get("FLOWZA_API_TOKEN", "")
+
+
+def _token_required():
+    return bool(_api_token()) and (request.remote_addr or "") not in ALLOWED_ORIGIN_HOSTS
+
+
 @app.before_request
 def _guard_origin():
+    if request.path.startswith(("/api/", "/hook/")) and _token_required():
+        provided = (request.headers.get("X-Flowza-Token")
+                    or request.args.get("token") or "")
+        if not token_ok(provided, _api_token()):
+            return jsonify({"ok": False,
+                            "error": "нужен заголовок X-Flowza-Token"}), 401
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return None
     if not request.path.startswith("/api/"):
@@ -400,8 +474,8 @@ def api_run():
     wait = request.args.get("wait") in ("1", "true", "yes")
     state, error = start_run(graph, seed, "manual", wait=wait)
     if error:
-        return jsonify({"ok": False, "error": error}), 409
-    if wait:
+        return jsonify({"ok": False, "error": error}), 429
+    if wait and state.status not in PENDING_STATUSES:
         body = dict(state.result or {})
         body.update({"ok": state.status == "done", "run_id": state.run_id,
                      "status": state.status, "warnings": graph.load_warnings})
@@ -416,7 +490,7 @@ def api_run_state(run_id):
     if state is None:
         abort(404, description="прогон не найден")
     with RUN_LOCK:
-        finished = state.status != "running"
+        finished = state.status not in PENDING_STATUSES
     body = state.snapshot(with_result=finished)
     body.update({"ok": True})
     return jsonify(body)
@@ -424,7 +498,9 @@ def api_run_state(run_id):
 
 @app.route("/api/cancel", methods=["POST"])
 def api_cancel():
-    run_id = cancel_active()
+    body = request.get_json(silent=True)
+    target = body.get("run_id") if isinstance(body, dict) else request.args.get("run_id")
+    run_id = cancel_run(target)
     if not run_id:
         return jsonify({"ok": False, "error": "нет активного прогона"}), 409
     return jsonify({"ok": True, "run_id": run_id})
@@ -563,6 +639,14 @@ def _scheduler_runner(node_id, interval):
 
 def launch(host="127.0.0.1", port=8765, open_browser=True):
     global SCHEDULER
+    if not is_loopback_host(host) and not _api_token():
+        print(f"[Flowza] Адрес {host} открывает API всей сети. Задайте токен:",
+              file=sys.stderr)
+        print("[Flowza]   set FLOWZA_API_TOKEN=длинная-строка  (Linux: export)",
+              file=sys.stderr)
+        print("[Flowza] Запросы к /api/* тогда требуют заголовок X-Flowza-Token.",
+              file=sys.stderr)
+        raise SystemExit(2)
     _setup_logging()
     SCHEDULER = Scheduler(graph_provider=_current_graph,
                           runner=_scheduler_runner, tick=1.0)

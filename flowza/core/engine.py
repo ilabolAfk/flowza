@@ -9,7 +9,7 @@ import logging
 import time
 from dataclasses import dataclass, field, fields
 
-from ..model.graph import Graph, find_cycles
+from ..model.graph import Graph, find_cycles, topological_order
 from ..model.registry import NodeError, run_node
 from .context import CANCELLED, TIMEOUT, RunAborted, RunContext
 
@@ -80,30 +80,6 @@ class RunResult:
                 "order": self.order, "summary": self.summary,
                 "cancelled": self.cancelled, "timed_out": self.timed_out,
                 "error": self.error, "ms": self.ms}
-
-
-def topological_order(graph):
-    """Порядок выполнения + список нод, застрявших в циклах."""
-    indegree = {node_id: 0 for node_id in graph.nodes}
-    children = {node_id: [] for node_id in graph.nodes}
-    for edge in graph.edges:
-        if edge.source_id in graph.nodes and edge.target_id in graph.nodes:
-            indegree[edge.target_id] += 1
-            children[edge.source_id].append(edge.target_id)
-
-    queue = [node_id for node_id in graph.nodes if indegree[node_id] == 0]
-    order = []
-    index = 0
-    while index < len(queue):
-        current = queue[index]
-        index += 1
-        order.append(current)
-        for child in children[current]:
-            indegree[child] -= 1
-            if indegree[child] == 0:
-                queue.append(child)
-    cycles = [node_id for node_id, degree in indegree.items() if degree > 0]
-    return order, cycles
 
 
 def _emit(progress, payload):

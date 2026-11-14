@@ -264,8 +264,8 @@ class Graph:
         return issues
 
 
-def find_cycles(graph):
-    """Идентификаторы нод, которые остались за топологической сортировкой."""
+def topological_order(graph):
+    """Порядок выполнения нод и идентификаторы нод, застрявших в циклах."""
     indegree = {node_id: 0 for node_id in graph.nodes}
     children = {node_id: [] for node_id in graph.nodes}
     for edge in graph.edges:
@@ -274,12 +274,20 @@ def find_cycles(graph):
             children[edge.source_id].append(edge.target_id)
 
     queue = [node_id for node_id, degree in indegree.items() if degree == 0]
-    seen = 0
-    while queue:
-        current = queue.pop()
-        seen += 1
+    order = []
+    index = 0
+    while index < len(queue):
+        current = queue[index]
+        index += 1
+        order.append(current)
         for child in children[current]:
             indegree[child] -= 1
             if indegree[child] == 0:
                 queue.append(child)
-    return [node_id for node_id, degree in indegree.items() if degree > 0]
+    cycles = [node_id for node_id, degree in indegree.items() if degree > 0]
+    return order, cycles
+
+
+def find_cycles(graph):
+    """Идентификаторы нод, которые остались за топологической сортировкой."""
+    return topological_order(graph)[1]
